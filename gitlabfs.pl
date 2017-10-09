@@ -1,10 +1,12 @@
 #!/usr/bin/env perl
-use strictures 1;
+use strict;
+use warnings;
 use Smart::Comments -ENV;
 use GitLab::API::v3;
 use GitLab::API::v3::Constants qw( :all );
-
-
+use File::Basename;
+use List::MoreUtils qw(uniq);
+use Memoize;
 
 use Getopt::Long;
 use Pod::Usage qw( pod2usage );
@@ -35,6 +37,8 @@ $token ||= $ENV{GITLAB_API_V3_TOKEN};
 
 pod2usage('give url and token') unless $url and $token;
 
+memoize('gitlab_fetch_projects');
+
 
 my $api = GitLab::API::v3->new(
     url   => $url,
@@ -43,51 +47,75 @@ my $api = GitLab::API::v3->new(
 
 ### api: $api
 
-my $projects = $api->all_projects();
-my @pnames = map { $_->{name_with_namespace}} @$projects;
-### pnames: @pnames
+sub gitlab_fetch_projects {
+	my $projects = $api->all_projects();
+	my @pnames = map { $_->{name_with_namespace}} @$projects;
+
+	return \@pnames;
+}
+
+
 use Fuse qw(fuse_get_context);
 use POSIX qw(ENOENT EISDIR EINVAL);
 
-my $readonly = 0644;
+my $READONLY = 0644;
+my $DEFAULT_TYPE = 0040;
+my $DEFAULT_BLOCKSIZE = 1024;
 
 
-my (%tree) = (
-    '/' => {
-	projects => {
-	    type => 0040,
-	    mode => $readonly,
+
+sub dir_entry {
+	my ($name) = @_;
+	return {
+		type => $DEFAULT_TYPE,
+	    mode => $READONLY,
 	    ctime => time(),
-	},
-    }
-);
+	};
+}
+
+sub is_dir_equal {
+	my ($dir, $ref) = @_;
+
+	$ref .= '/' unless $ref =~ m|/$|;
+	$dir .= '/' unless $dir =~ m|/$|;
+
+	return $ref eq $dir;
+}
+
+sub getattr_error { return -ENOENT() }
 
 
-my (%files) = (
-    projects => {
-	type => 0040,
-	mode => $readonly,
-	ctime => time(),
-    },
-    
-    '.' => {
-	type => 0040,
-	mode => 0755,
-	ctime => time()-1000
-    }
-);
 
-# populate groups from projects
-#my @groups = map { } @pnames;
-    
-sub populate {
-    my $file = shift;
-    ### populate() - file: $file 
-    if ($file =~ /projects/) {
+sub getattr_dir {
+	my ($size, $type) = @_;
+	$size //= 0;
+	$type //= $DEFAULT_TYPE;
 
-    }
-}	
-    
+	my $mode = $READONLY;
+	my $modes = ($type<<9) + $mode;
+	my ($dev, $ino, $rdev, $blocks, $gid, $uid, $nlink, $blksize) = (0,0,0,1,0,0,1,$DEFAULT_BLOCKSIZE);
+	my ($atime, $ctime, $mtime);
+	$atime = $ctime = $mtime = time();
+
+	return ($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+}
+
+sub getattr_file {
+	my ($size, $type) = @_;
+	$size //= 0;
+	$type //= $DEFAULT_TYPE;
+
+	my $mode = $READONLY;
+	my ($modes) = ($type<<9) + $mode;
+	my ($dev, $ino, $rdev, $blocks, $gid, $uid, $nlink, $blksize) = (0,0,0,1,0,0,1,$DEFAULT_BLOCKSIZE);
+	my ($atime, $ctime, $mtime);
+	$atime = $ctime = $mtime = time();
+
+	return ($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+}
+
+
+
 sub filename_fixup {
 	my ($file) = shift;
 	$file =~ s,^/,,;
@@ -95,68 +123,115 @@ sub filename_fixup {
 	return $file;
 }
 
-sub e_getattr {
-    my $file = shift;
-    ### getattr file: $file
-    
-    $file = filename_fixup($file);
-    #### getattr, after fixup file: $file
-    $file =~ s,^/,,;
-     #### getattr, after s// file: $file
-	$file = '.' unless length($file);
-	return -ENOENT() unless exists($files{$file});
-	my ($size) = exists($files{$file}{cont}) ? length($files{$file}{cont}) : 0;
-	$size = $files{$file}{size} if exists $files{$file}{size};
-	my ($modes) = ($files{$file}{type}<<9) + $files{$file}{mode};
-	my ($dev, $ino, $rdev, $blocks, $gid, $uid, $nlink, $blksize) = (0,0,0,1,0,0,1,1024);
-	my ($atime, $ctime, $mtime);
-	$atime = $ctime = $mtime = $files{$file}{ctime};
-	# 2 possible types of return values:
-	#return -ENOENT(); # or any other error you care to
-	#print(join(",",($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks)),"\n");
-	return ($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+sub gitlab_getattr {
+    my $path = shift;
+    ### gitlab_getattr $path: $path
+
+	return getattr_dir() if $path eq '/';
+
+	return gitlab_getattr_projects($path) if $path =~ qw{/projects};
+
+	### gitlab_getattr: ignoring entry: $path
+	return -ENOENT();
 }
 
-sub e_getdir {
-    my $dir = shift;
-    ### getdir dir: $dir
-	# return as many text filenames as you like, followed by the retval.
-    #print((scalar keys %files)."\n");
-    my $files = $tree{$dir} or return -ENOENT();
-    
-    return (keys %$files),0;
+sub gitlab_getattr_projects {
+    my $path = shift;
+    ### gitlab_getattr_projects $path: $path
+
+	return getattr_dir() if is_dir_equal($path, '/projects/');
+
+	return getattr_dir() if $path =~ m|/projects/([^/]+){1,2}|;
+
+	### gitlab_getattr: ignoring entry: $path
+	return -ENOENT();
 }
+
+sub gitlab_getdir {
+    my $dir = shift;
+    ### gitlab_getdir dir: $dir
+
+	return gitlab_getdir_root()	if $dir eq '/';
+
+	return gitlab_getdir_projects($dir) if $dir =~ m|/projects|;
+
+    return -ENOENT();
+}
+
+sub gitlab_getdir_root {
+    return ("projects"), 0;
+}
+
+sub gitlab_getdir_projects {
+	my $dir = shift;
+
+	### gitlab_getdir_projects dir: $dir
+	return gitlab_getdir_project_groups($dir) if is_dir_equal($dir, '/projects/');
+
+	return gitlab_getdir_project_group($dir);
+    return ("projects"), 0;
+}
+
+sub gitlab_getdir_project_groups {
+	my $dir = shift;
+
+	### gitlab_getdir_project_groups dir: $dir
+	my $pnames = gitlab_fetch_projects();
+	### $pnames: $pnames
+
+	my @groups = sort(uniq(
+		map {
+			my ($dir) = ($_ =~ m|(.*)\s+/|);
+			$dir;
+		} @$pnames));
+
+	#### @groups: @groups
+
+    return (@groups), 0;
+}
+
+sub gitlab_getdir_project_group {
+	my $dir = shift;
+
+	### gitlab_getdir_project_group dir: $dir
+	my $pnames = gitlab_fetch_projects();
+	### $pnames: $pnames
+
+
+
+}
+
 
 sub e_open {
-	# VFS sanity check; it keeps all the necessary state, not much to do here.
-    my $file = filename_fixup(shift);
-    my ($flags, $fileinfo) = @_;
-    print("open called $file, $flags, $fileinfo\n");
-	return -ENOENT() unless exists($files{$file});
-	return -EISDIR() if $files{$file}{type} & 0040;
-    
-    my $fh = [ rand() ];
-    
-    print("open ok (handle $fh)\n");
-    return (0, $fh);
+#	# VFS sanity check; it keeps all the necessary state, not much to do here.
+#    my $file = filename_fixup(shift);
+#    my ($flags, $fileinfo) = @_;
+#    print("open called $file, $flags, $fileinfo\n");
+#	return -ENOENT() unless exists($files{$file});
+#	return -EISDIR() if $files{$file}{type} & 0040;
+#
+#    my $fh = [ rand() ];
+#
+#    print("open ok (handle $fh)\n");
+#    return (0, $fh);
 }
 
 sub e_read {
-	# return an error numeric, or binary/text string.  (note: 0 means EOF, "0" will
-	# give a byte (ascii "0") to the reading program)
-	my ($file) = filename_fixup(shift);
-    my ($buf, $off, $fh) = @_;
-    print "read from $file, $buf \@ $off\n";
-    print "file handle:\n", Dumper($fh);
-	return -ENOENT() unless exists($files{$file});
-	if(!exists($files{$file}{cont})) {
-		return -EINVAL() if $off > 0;
-		my $context = fuse_get_context();
-		return sprintf("pid=0x%08x uid=0x%08x gid=0x%08x\n",@$context{'pid','uid','gid'});
-	}
-	return -EINVAL() if $off > length($files{$file}{cont});
-	return 0 if $off == length($files{$file}{cont});
-	return substr($files{$file}{cont},$off,$buf);
+#	# return an error numeric, or binary/text string.  (note: 0 means EOF, "0" will
+#	# give a byte (ascii "0") to the reading program)
+#	my ($file) = filename_fixup(shift);
+#    my ($buf, $off, $fh) = @_;
+#    print "read from $file, $buf \@ $off\n";
+#    print "file handle:\n", Dumper($fh);
+#	return -ENOENT() unless exists($files{$file});
+#	if(!exists($files{$file}{cont})) {
+#		return -EINVAL() if $off > 0;
+#		my $context = fuse_get_context();
+#		return sprintf("pid=0x%08x uid=0x%08x gid=0x%08x\n",@$context{'pid','uid','gid'});
+#	}
+#	return -EINVAL() if $off > length($files{$file}{cont});
+#	return 0 if $off == length($files{$file}{cont});
+#	return substr($files{$file}{cont},$off,$buf);
 }
 
 sub e_statfs { return 255, 1, 1, 1, 1, 2 }
@@ -164,13 +239,13 @@ sub e_statfs { return 255, 1, 1, 1, 1, 2 }
 # If you run the script directly, it will run fusermount, which will in turn
 
 Fuse::main(
-	mountpoint=>$mount_point,
-	getattr=>"main::e_getattr",
-	getdir =>"main::e_getdir",
-	open   =>"main::e_open",
-	statfs =>"main::e_statfs",
-	read   =>"main::e_read",
-	threaded=>0
+	mountpoint => $mount_point,
+	getattr => "main::gitlab_getattr",
+	getdir => "main::gitlab_getdir",
+	open   => "main::e_open",
+	statfs => "main::e_statfs",
+	read   => "main::e_read",
+	threaded => 0
 );
 
 

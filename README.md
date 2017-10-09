@@ -6,7 +6,13 @@ Gitlab virtual filesystem
 
 install libfuse-dev
 ```
-sudo apt install libfuse-dev libhttp-headers-fast-perl 
+sudo apt install libfuse-dev
+# depending on the system
+sudo adduser karl fuse
+# then logout/login
+
+# maybe
+sudo apt install libhttp-headers-fast-perl
 ```
 
 install those perl modules:
@@ -18,11 +24,11 @@ install those perl modules:
   - Memoize
 
 ```
- 2241  sudo cpanm Cookie::Baker
- 2242  sudo cpanm GitLab::API::v3
- 2243  sudo cpanm Role::REST::Client
- 2244  sudo cpanm HTTP::Entity::Parser
- 2245  sudo cpanm GitLab::API::v3
+sudo cpanm Cookie::Baker
+sudo cpanm GitLab::API::v3
+sudo cpanm Role::REST::Client
+sudo cpanm HTTP::Entity::Parser
+sudo cpanm GitLab::API::v3
 
 ```
 
