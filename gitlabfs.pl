@@ -99,34 +99,84 @@ has 'group' => (is  => 'ro', isa => 'Str', required => 1);
 has 'project' => (is  => 'ro', isa => 'Str', required => 1);
 has 'path' => (is  => 'ro', isa => 'Str', required => 1);
 has 'entry' => (is => 'rw', isa => 'HashRef');
-has 'is_dir' => (is => 'rw', isa => 'Bool');
+
+my %FILECACHE;
+
+sub is_dir {
+ shift->entry->{type} eq 'tree'
+}
+
+sub is_submodule {
+ shift->entry->{type} eq 'commit'
+}
+
+sub is_symlink {
+ my $self = shift;
+ $self->entry->{type} eq 'blob' &&
+	$self->entry->{mode} eq '120000';
+}
+
+sub is_regular_file {
+  my $self = shift;
+  return !$self->is_dir && !$self->is_symlink && !$self->is_submodule;
+}
 
 
 sub BUILD {
-	my $self = shift;
+ my $self = shift;
 
-	my $entry = Gitlab::fetch_project_tree_blob($self->group,
+ my $entry = Gitlab::fetch_project_tree_entry($self->group,
 		$self->project, $self->path);
-	die "error fetching entry for $self" unless $entry;
+ die "error fetching entry for $self" unless $entry;
 
-	$self->is_dir($entry->{type} eq 'tree');
-	$self->entry($entry);
+ $self->entry($entry);
+}
+
+sub url {
+  my $self = shift;
+  my ($group, $project, $path) = ($self->group, $self->project, $self->path);
+  return join('/', $group, $project, $path);
+}
+
+sub _has_file { return exists $FILECACHE{shift->url} }
+
+sub _get_file {
+  my $self = shift;
+  my $url = $self->url;
+
+  if (!$self->_has_file) {
+    $FILECACHE{$url} = Gitlab::fetch_project_file($self->group,
+      $self->project, $self->path);
+  }
+
+  return $FILECACHE{$url};
 }
 
 sub _fetch_file_names {
-	my $self = shift;
-	my $tree = Gitlab::fetch_project_tree_dir($self->group, $self->project,
-		$self->path);
+ my $self = shift;
+ my $tree = Gitlab::fetch_project_tree($self->group, $self->project,
+	$self->path);
 
-	my @fnames = map { $_->{name} }  @{$tree};
+ my @fnames = map { $_->{name} }  @{$tree};
 
-	return @fnames;
+ return @fnames;
+}
+
+sub _file_size {
+  my $self = shift;
+  return 0 unless $self->_has_file;
+
+  return $self->_get_file->{size};
 }
 
 sub getattr {
-	my $self = shift;
-	main::make_getattr(
-		size => $self->size,
+ my $self = shift;
+
+ # trigger the loading of file object
+ $self->_get_file if $self->is_regular_file;
+
+ main::make_getattr(
+		size => $self->_file_size,
 #		type => $self->type,
 		mode => oct($self->entry->{mode}));
 }
@@ -141,13 +191,31 @@ sub getdir {
 	return (@files, 0);
 }
 
+sub open {
+	my $self = shift;
+	#### FsTree.open() : $self
+	return -POSIX::EISDIR() if $self->is_dir;
+	return 0;
+}
+
+sub read {
+  my $self = shift;
+  my ($buf, $off, $fh) = @_;
+  #### FsTree.read() : $self, $buf, $off, $fh
+
+  my $read = substr($self->_get_file->{content}, $off, $buf);
+  #### FsTree.read() $read: $read
+
+ return $read;
+}
+
 1;
 
 package Gitlab;
 use Moose;
 use GitLab::API::v3;
 use GitLab::API::v3::Constants qw( :all );
-
+ use MIME::Base64;
 our $API;
 
 sub init {
@@ -156,6 +224,23 @@ sub init {
     	url   => $url,
     	token => $token,
  	);
+}
+
+sub fetch_project_file {
+ my ($group, $project, $path, $ref) = @_;
+ $ref //= 'master';
+
+ die "bad empty filepath" if $path eq '';
+
+ ### fetch_project_file:$group, $project, $path, $ref
+
+ my $proj = fetch_project($group, $project);
+ my $file = $API->file($proj->{id}, {file_path => $path, ref => $ref});
+
+ $file->{content} = decode_base64($file->{content});
+ delete $file->{encoding};
+
+ return $file;
 }
 
 sub fetch_groups {
@@ -193,22 +278,11 @@ sub fetch_project_tree {
 	return $API->tree($proj->{id}, {path => $path});
 }
 
-sub fetch_project_tree_dir {
+sub fetch_project_tree_entry {
 	my ($group, $project, $path) = @_;
 	die "bad empty (tree) path" if ($path eq '');
 
-	#### fetch_project_tree_dir($group, $project, $path): $group, $project, $path
-
-	my $tree = fetch_project_tree($group, $project, $path);
-
-	return $tree;
-}
-
-sub fetch_project_tree_blob {
-	my ($group, $project, $path) = @_;
-	die "bad empty (tree) path" if ($path eq '');
-
-	### fetch_project_tree_blob($group, $project, $path): $group, $project, $path
+	### fetch_project_tree_entry($group, $project, $path): $group, $project, $path
 
 	$path =~ s|/$||;
 	my @dirs = split qw(/), $path;
@@ -228,6 +302,9 @@ sub fetch_project_tree_blob {
 	return undef;
 }
 
+
+
+1;
 
 no Moose;
 __PACKAGE__->meta->make_immutable;
@@ -281,6 +358,7 @@ memoize('Gitlab::fetch_groups');
 memoize('Gitlab::fetch_projects');
 memoize('Gitlab::fetch_project');
 memoize('Gitlab::fetch_group_projects');
+memoize('Gitlab::fetch_project_file');
 
 sub is_dir_equal {
 	my ($dir, $ref) = @_;
@@ -372,17 +450,22 @@ sub dispatch_projects {
 }
 
 
-sub gitlab_getattr {
-	dispatch(shift)->getattr();
+sub gfs_getattr {
+ my $path = shift;
+ ###  gfs_getattr: $path
+ dispatch($path)->getattr();
 }
 
-sub gitlab_getdir {
-    dispatch(shift)->getdir();
+sub gfs_getdir {
+ my $path = shift;
+ ###  gfs_getdir: $path
+ dispatch($path)->getdir();
 }
 
-
-
-sub e_open {
+sub gfs_open {
+  my $path = shift;
+  ###  gfs_open: $path
+	dispatch($path)->open();
 #	# VFS sanity check; it keeps all the necessary state, not much to do here.
 #    my $file = filename_fixup(shift);
 #    my ($flags, $fileinfo) = @_;
@@ -396,7 +479,10 @@ sub e_open {
 #    return (0, $fh);
 }
 
-sub e_read {
+sub gfs_read {
+  my $path = shift;
+  ###  gfs_read: $path, @_
+  return dispatch($path)->read(@_);
 #	# return an error numeric, or binary/text string.  (note: 0 means EOF, "0" will
 #	# give a byte (ascii "0") to the reading program)
 #	my ($file) = filename_fixup(shift);
@@ -420,11 +506,11 @@ sub e_statfs { return 255, 1, 1, 1, 1, 2 }
 use Fuse qw(fuse_get_context);
 Fuse::main(
 	mountpoint => $mount_point,
-	getattr => "main::gitlab_getattr",
-	getdir => "main::gitlab_getdir",
-	open   => "main::e_open",
+	getattr => "main::gfs_getattr",
+	getdir => "main::gfs_getdir",
+	open   => "main::gfs_open",
 	statfs => "main::e_statfs",
-	read   => "main::e_read",
+	read   => "main::gfs_read",
 	threaded => 0
 );
 
